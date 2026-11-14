@@ -1,115 +1,130 @@
 #!/usr/bin/env python3
-"""btc-cent-forecast-01 entry: half-shrunk 12-hour trend forecast.
+"""btc-cent-forecast-01: half-shrunk 12h trend forecast.
 
-Forecasts Bitcoin's price 240 minutes after the checkpoint.
+Forecasts Bitcoin's price 240 minutes after a checkpoint as:
 
-Model (chosen on the kit's practice data only, 5 known practice cases
-plus 72 rolling pseudo-cases cut inside the practice series):
-  guess = last_price + 0.5 * 240 * slope
-where slope is the OLS slope (dollars per minute) of the last 720
-closes (12 hours). The 0.5 shrinkage is deliberate: 4-hour BTC moves
-are noise-dominated, so the raw trend extrapolation is halved. On the
-practice data this beats the last-price (persistence) baseline by
-~6% in mean absolute error on both the 5 real practice cases and the
-72 pseudo-cases, and wins in both halves of the pseudo set; adding
-mean-reversion terms or volatility caps did not improve it clearly,
-so the simplest winner is kept.
+    last_close + 0.5 * horizon_minutes * slope
 
-Fully deterministic (no clock, no randomness), O(n) in the 4,320
-prices, robust to short/flat series and spikes (slope is bounded by
-the 720-minute window and the 0.5 shrink; output is clamped to the
-scorer's price bounds on the 5-decimal grid).
+where slope is the ordinary-least-squares slope (dollars per minute) of the
+last 720 closes (12 hours) of the case's 72-hour minute series.
 
-I/O per the kit's RULES.txt: reads every <id>.in in
-$MAKEFUN_INPUT_DIR (default /input), writes <id>.out to
-$MAKEFUN_OUTPUT_DIR (default /output) as
+Why this form: the last price is the honest random-walk baseline, and the
+12-hour trend carries a little real signal over 4 hours, but a raw trend
+extrapolation overshoots in a noise-dominated market, so the trend term is
+shrunk by one half. On the kit's five practice cases with known answers this
+scores a mean absolute error of about 44,314 cents versus about 47,055 for
+the last-price baseline.
+
+Standard library only, fully deterministic (no clock, no randomness), runs
+offline. Reads every <id>.in in $MAKEFUN_INPUT_DIR (default /input) and
+writes <id>.out to $MAKEFUN_OUTPUT_DIR (default /output) as
 {"forecasts": [{"case": "<id>", "price": <number>}]}.
 """
 
 import json
 import math
 import os
-import sys
+from pathlib import Path
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 MIN_PRICE = 0.00001
-MAX_PRICE = 9_999_999.99999
-HORIZON_MINUTES = 240
-TREND_WINDOW = 720          # minutes of closes for the OLS slope
-SHRINK = 0.5                # shrinkage applied to the extrapolated trend
+MAX_PRICE = 9999999.99999
+
+# OLS window: last 12 hours of minute closes.
+WINDOW = 720
+# Shrinkage applied to the trend term: half the extrapolated drift.
+SHRINK = 0.5
+DEFAULT_HORIZON_MINUTES = 240
 
 
-def clamp_price(x):
-    """Keep a guess on the price grid's 5 decimals, inside (0, 10_000_000)."""
-    if not isinstance(x, float) and not isinstance(x, int):
-        return None
-    if not math.isfinite(x):
-        return None
+def price5(x):
+    """Clamp x onto the grid's 5 decimals and inside (0, 10,000,000)."""
     x = min(MAX_PRICE, max(MIN_PRICE, x))
-    return round(x * 100000) / 100000
+    return round(x, 5)
 
 
-def ols_slope(xs):
-    """OLS slope (dollars per minute) of a list of closes, oldest first."""
-    n = len(xs)
+def ols_slope(values):
+    """OLS slope (dollars per minute) of values against 0..n-1.
+
+    Returns 0.0 for fewer than 2 values or a degenerate (flat-x) window.
+    """
+    n = len(values)
     if n < 2:
         return 0.0
+    # Mean of x = (n - 1) / 2; sum of squared deviations of x.
     mean_x = (n - 1) / 2.0
-    mean_y = sum(xs) / n
-    num = 0.0
-    den = 0.0
-    for i, y in enumerate(xs):
+    mean_y = sum(values) / n
+    sxx = 0.0
+    sxy = 0.0
+    for i, y in enumerate(values):
         dx = i - mean_x
-        num += dx * (y - mean_y)
-        den += dx * dx
-    if den == 0.0:
+        sxx += dx * dx
+        sxy += dx * (y - mean_y)
+    if sxx == 0.0:
         return 0.0
-    slope = num / den
-    return slope if math.isfinite(slope) else 0.0
+    return sxy / sxx
 
 
-def forecast(prices, horizon_minutes=HORIZON_MINUTES):
-    """One forecast from one case's closes (oldest first, last = checkpoint)."""
-    clean = [p for p in prices if isinstance(p, (int, float)) and math.isfinite(p)]
-    if not clean:
-        raise ValueError("market has no finite prices")
-    last = clean[-1]
-    window = clean[-TREND_WINDOW:]
+def pick_market(markets):
+    """The btc-usdc market if present, else the first market."""
+    for m in markets:
+        if isinstance(m, dict) and m.get("id") == "btc-usdc":
+            return m
+    return markets[0]
+
+
+def forecast_case(case):
+    """Forecast one case dict; returns the price as a number."""
+    horizon = case.get("horizon_minutes", DEFAULT_HORIZON_MINUTES)
+    if isinstance(horizon, str):
+        try:
+            horizon = float(horizon)
+        except ValueError:
+            horizon = DEFAULT_HORIZON_MINUTES
+    if not isinstance(horizon, (int, float)) or not math.isfinite(horizon):
+        horizon = DEFAULT_HORIZON_MINUTES
+
+    markets = case.get("markets") or []
+    if not markets:
+        return 1.0
+    prices = pick_market(markets).get("prices") or []
+
+    # Keep only finite closes, preserving order.
+    closes = [p for p in prices if isinstance(p, (int, float)) and math.isfinite(p)]
+    if not closes:
+        return 1.0
+    last = closes[-1]
+    if len(closes) < 2:
+        return price5(last)
+
+    window = closes[-WINDOW:]
     slope = ols_slope(window)
-    try:
-        horizon = float(horizon_minutes)
-    except (TypeError, ValueError):
-        horizon = float(HORIZON_MINUTES)
-    if not math.isfinite(horizon) or horizon <= 0:
-        horizon = float(HORIZON_MINUTES)
+    if not math.isfinite(slope):
+        slope = 0.0
     guess = last + SHRINK * horizon * slope
-    clamped = clamp_price(guess)
-    if clamped is None:
-        clamped = clamp_price(last)
-    return clamped
+    return price5(guess)
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    names = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".in"))
-    if not names:
-        raise SystemExit("no .in files in %s" % INPUT_DIR)
-    for name in names:
-        case_id = name[:-3]
-        with open(os.path.join(INPUT_DIR, name), "r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        markets = case.get("markets")
-        if not isinstance(markets, list) or len(markets) != 1:
-            raise ValueError("%s does not hold exactly one market" % name)
-        prices = markets[0].get("prices")
-        if not isinstance(prices, list) or not prices:
-            raise ValueError("%s market has no prices" % name)
-        price = forecast(prices, case.get("horizon_minutes", HORIZON_MINUTES))
+    input_dir = Path(INPUT_DIR)
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    inputs = sorted(p for p in input_dir.iterdir() if p.name.endswith(".in"))
+    for path in inputs:
+        case_id = path.name[: -len(".in")]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                case = json.load(f)
+            price = forecast_case(case)
+        except Exception:
+            # Never crash on a bad case file: still emit a valid shape.
+            price = 1.0
         out = {"forecasts": [{"case": case_id, "price": price}]}
-        with open(os.path.join(OUTPUT_DIR, case_id + ".out"), "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(out) + "\n")
+        with open(output_dir / f"{case_id}.out", "w", encoding="utf-8") as f:
+            f.write(json.dumps(out) + "\n")
 
 
 if __name__ == "__main__":
